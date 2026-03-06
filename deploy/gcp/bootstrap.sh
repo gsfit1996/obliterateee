@@ -89,10 +89,11 @@ Group=${APP_GROUP}
 WorkingDirectory=${APP_DIR}
 Environment=PYTHONUTF8=1
 Environment=PYTHONIOENCODING=utf-8
+Environment=OBLITERATUS_API_DEFAULT_MODEL=Qwen/Qwen2.5-0.5B-Instruct
 Environment=HF_HOME=${APP_DIR}/.hf_home
 Environment=TRANSFORMERS_CACHE=${APP_DIR}/.hf_home/hub
 Environment=HF_HUB_CACHE=${APP_DIR}/.hf_home/hub
-ExecStart=${APP_DIR}/.venv/bin/python -m obliteratus.cli ui --host ${HOST_BIND} --port ${APP_PORT} --no-browser --quiet
+ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/app.py --host ${HOST_BIND} --port ${APP_PORT}
 Restart=always
 RestartSec=5
 TimeoutStartSec=180
