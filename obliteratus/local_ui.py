@@ -14,12 +14,34 @@ import platform
 import shutil
 import sys
 import time
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 console = Console()
+
+
+def _load_repo_app_launch():
+    """Load the workspace app.py directly so launcher and direct runs share the same app object."""
+    project_root = Path(__file__).resolve().parent.parent
+    app_path = project_root / "app.py"
+    if not app_path.exists():
+        raise FileNotFoundError(f"Could not find app.py at {app_path}")
+
+    spec = spec_from_file_location("obliteratus_workspace_app", app_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load app module from {app_path}")
+
+    module = module_from_spec(spec)
+    sys.modules.setdefault(spec.name, module)
+    spec.loader.exec_module(module)
+    launch_fn = getattr(module, "launch", None)
+    if launch_fn is None:
+        raise AttributeError(f"No launch() found in {app_path}")
+    return launch_fn
 
 # ── ASCII banner ────────────────────────────────────────────────────────────
 
@@ -292,7 +314,7 @@ def launch_local_ui(
     console.print("[dim]Loading OBLITERATUS UI (this may take a moment on first run)...[/dim]")
     start = time.time()
 
-    from app import launch as app_launch
+    app_launch = _load_repo_app_launch()
 
     elapsed = time.time() - start
     if not quiet:
