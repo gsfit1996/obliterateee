@@ -99,6 +99,10 @@ _state: dict = {
     "session_label": None,
     "status": "idle",  # idle | obliterating | ready
     "log": [],
+    "busy_detail": None,
+    "busy_started_at": None,
+    "busy_heartbeat": None,
+    "busy_thread": None,
     # Activation steering metadata (survives model reload)
     "steering": None,  # dict with refusal_directions, strong_layers, steering_strength
     # Checkpoint directory for ZeroGPU reload (model tensors may become stale
@@ -124,6 +128,7 @@ _obliterate_counter: int = 0
 # Flag to suppress session_model_dd.change when obliterate programmatically
 # sets the dropdown value (prevents wasteful GPU re-allocation on ZeroGPU)
 _skip_session_load: bool = False
+_BUSY_STALE_SECS = int(os.environ.get("OBLITERATUS_BUSY_STALE_SECS", "1800"))
 
 _API_MAX_LIBERATION_METHOD_DISPLAY = "nuclear (maximum force combo)"
 _API_MAX_PROMPT_VOLUME_CHOICE = "512 (built-in max)"
@@ -156,6 +161,63 @@ _API_EXPOSED_MODEL_ID_SET = set(_API_EXPOSED_MODEL_IDS)
 _API_MODEL_PRIORITY_INDEX = {
     model_id: idx for idx, model_id in enumerate(_API_MODEL_PRIORITY)
 }
+
+
+def _format_elapsed_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def _clear_busy_locked(next_status: str) -> None:
+    _state["status"] = next_status
+    _state["busy_detail"] = None
+    _state["busy_started_at"] = None
+    _state["busy_heartbeat"] = None
+    _state["busy_thread"] = None
+
+
+def _touch_busy(detail: str | None = None, worker: threading.Thread | None = None) -> None:
+    with _lock:
+        if _state["status"] != "obliterating":
+            return
+        _state["busy_heartbeat"] = time.time()
+        if detail:
+            _state["busy_detail"] = detail
+        if worker is not None:
+            _state["busy_thread"] = worker
+
+
+def _begin_busy(model_choice: str, method: str, detail: str,
+                worker: threading.Thread | None = None) -> str | None:
+    now = time.time()
+    with _lock:
+        if _state["status"] == "obliterating":
+            active_thread = _state.get("busy_thread")
+            heartbeat = _state.get("busy_heartbeat") or _state.get("busy_started_at")
+            stale = False
+            if isinstance(active_thread, threading.Thread):
+                stale = not active_thread.is_alive()
+            elif heartbeat is not None:
+                stale = (now - heartbeat) > _BUSY_STALE_SECS
+
+            if stale:
+                _clear_busy_locked("idle")
+            else:
+                active_detail = _state.get("busy_detail") or "another run"
+                started = _state.get("busy_started_at") or now
+                age = _format_elapsed_seconds(now - started)
+                return f"**Error:** An obliteration is already in progress: `{active_detail}` ({age})."
+
+        _state["log"] = []
+        _state["model_name"] = model_choice
+        _state["method"] = method
+        _state["session_label"] = None
+        _state["busy_detail"] = detail
+        _state["busy_started_at"] = now
+        _state["busy_heartbeat"] = now
+        _state["busy_thread"] = worker
+        _state["status"] = "obliterating"
+    return None
 
 # ---------------------------------------------------------------------------
 # Model presets — 100+ models organized by provider
@@ -530,7 +592,7 @@ def _cleanup_disk():
         _state["session_label"] = None
         _state["output_dir"] = None
         _state["steering"] = None
-        _state["status"] = "idle"
+        _clear_busy_locked("idle")
 
     # Also clear GPU
     _clear_gpu()
@@ -1532,15 +1594,11 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
     dataset_key = get_source_key_from_label(dataset_source_choice) if dataset_source_choice else "builtin"
 
     _clear_gpu()
-    with _lock:
-        if _state["status"] == "obliterating":
-            yield "**Error:** An obliteration is already in progress.", "", gr.update(), gr.update(), gr.update(), gr.update()
-            return
-        _state["log"] = []
-        _state["status"] = "obliterating"
-        _state["model_name"] = model_choice
-        _state["method"] = method
-        _state["session_label"] = None
+    busy_detail = f"{method} on {model_choice}"
+    busy_error = _begin_busy(model_choice, method, busy_detail)
+    if busy_error:
+        yield busy_error, "", gr.update(), gr.update(), gr.update(), gr.update()
+        return
 
     with _lock:
         global _obliterate_counter
@@ -1559,6 +1617,7 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
 
     def on_log(msg):
         log_lines.append(msg)
+        _touch_busy(detail=busy_detail)
 
     def on_stage(result):
         stage_key = result.stage
@@ -1570,6 +1629,7 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
                        "excise": 3, "verify": 4, "rebirth": 5}
         idx = stage_order.get(stage_key, 0)
         progress((idx + 1) / 6, desc=f"{stage_key.upper()}")
+        _touch_busy(detail=busy_detail)
 
     quantization = _should_quantize(model_id, is_preset=is_preset)
 
@@ -1678,12 +1738,14 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
 
     worker = threading.Thread(target=run_pipeline, daemon=True)
     worker.start()
+    _touch_busy(detail=busy_detail, worker=worker)
 
     # Stream log updates while pipeline runs (max 45 minutes to prevent indefinite hang)
     _max_pipeline_secs = 45 * 60
     _pipeline_start = time.time()
     status_msg = "**Obliterating\u2026** (0s)"
     while worker.is_alive():
+        _touch_busy(detail=busy_detail, worker=worker)
         status_msg = f"**Obliterating\u2026** ({_elapsed()})"
         if len(log_lines) > last_yielded[0]:
             last_yielded[0] = len(log_lines)
@@ -1700,7 +1762,7 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
     # Handle error
     if error_ref[0] is not None:
         with _lock:
-            _state["status"] = "idle"
+            _clear_busy_locked("idle")
         err_msg = str(error_ref[0]) or repr(error_ref[0])
         log_lines.append(f"\nERROR: {err_msg}")
         _state["log"] = log_lines
@@ -1785,7 +1847,7 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
             with _lock:
                 _state["model"] = pipeline.handle.model
                 _state["tokenizer"] = pipeline.handle.tokenizer
-                _state["status"] = "ready"
+                _clear_busy_locked("ready")
         else:
             # Model too large for generation at full precision.  Free it and
             # reload a smaller copy so the KV cache fits in GPU.
@@ -1838,7 +1900,7 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
                     with _lock:
                         _state["model"] = model_reloaded
                         _state["tokenizer"] = tokenizer_reloaded
-                        _state["status"] = "ready"
+                        _clear_busy_locked("ready")
                     can_generate = True
                     log_lines.append("Reloaded in 4-bit — chat is ready!")
                 except Exception as e:
@@ -1880,14 +1942,14 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
                     with _lock:
                         _state["model"] = model_reloaded
                         _state["tokenizer"] = tokenizer_reloaded
-                        _state["status"] = "ready"
+                        _clear_busy_locked("ready")
                     can_generate = True
                     log_lines.append("Reloaded with CPU offload — chat is ready (may be slower).")
                 except Exception as e:
                     log_lines.append(f"CPU offload reload failed: {e}")
                     log_lines.append("Chat unavailable. Load the saved model on a larger instance.")
                     with _lock:
-                        _state["status"] = "idle"
+                        _clear_busy_locked("idle")
 
         # Build metrics summary card while pipeline is still alive
         metrics_card = _format_obliteration_metrics(pipeline, method, _elapsed())
@@ -1930,7 +1992,7 @@ def obliterate(model_choice: str, method_choice: str, hub_repo: str,
     except Exception as e:
         # Ensure status never gets stuck on "obliterating"
         with _lock:
-            _state["status"] = "idle"
+            _clear_busy_locked("idle")
         err_msg = str(e) or repr(e)
         log_lines.append(f"\nERROR (post-pipeline): {err_msg}")
         _state["log"] = log_lines
@@ -2837,18 +2899,16 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
             )
             return
 
-    with _lock:
-        if _state["status"] == "obliterating":
-            yield "**Error:** An obliteration is already in progress.", ""
-            return
-        _state["status"] = "obliterating"
-        _state["model_name"] = cfg["model_choice"]
-        _state["method"] = method_key
-        _state["session_label"] = None
+    busy_detail = f"load {choice}"
+    busy_error = _begin_busy(cfg["model_choice"], method_key, busy_detail, threading.current_thread())
+    if busy_error:
+        yield busy_error, ""
+        return
     _clear_gpu()
 
     # If we have a saved checkpoint on disk, load directly — no re-training!
     if checkpoint_dir and Path(checkpoint_dir).exists():
+        _touch_busy(detail=f"load checkpoint {choice}", worker=threading.current_thread())
         yield f"**Loading {choice}** from saved checkpoint (no re-training needed)...", ""
         progress(0.3, desc="Loading checkpoint...")
 
@@ -2869,7 +2929,7 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
                 _state["model"] = model_loaded
                 _state["tokenizer"] = tokenizer_loaded
                 _state["steering"] = None
-                _state["status"] = "ready"
+                _clear_busy_locked("ready")
                 _state["output_dir"] = checkpoint_dir
                 _state["session_label"] = choice
             progress(1.0, desc="Ready!")
@@ -2906,7 +2966,7 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
                     _state["model"] = model_loaded
                     _state["tokenizer"] = tokenizer_loaded
                     _state["steering"] = None
-                    _state["status"] = "ready"
+                    _clear_busy_locked("ready")
                     _state["output_dir"] = checkpoint_dir
                     _state["session_label"] = choice
                 progress(1.0, desc="Ready!")
@@ -2918,7 +2978,7 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
             except Exception:
                 _clear_gpu()
                 with _lock:
-                    _state["status"] = "idle"
+                    _clear_busy_locked("idle")
                 yield (
                     f"**Error:** Could not load {choice} from checkpoint (GPU too small).",
                     get_chat_header(),
@@ -2964,8 +3024,10 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
     progress(0.1, desc="Obliterating...")
     worker = threading.Thread(target=_run, daemon=True)
     worker.start()
+    _touch_busy(detail=f"re-obliterate {choice}", worker=worker)
 
     while worker.is_alive():
+        _touch_busy(detail=f"re-obliterate {choice}", worker=worker)
         time.sleep(1.0)
 
     worker.join()
@@ -2973,7 +3035,7 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
 
     if error_ref[0] is not None:
         with _lock:
-            _state["status"] = "idle"
+            _clear_busy_locked("idle")
         yield f"**Error loading {choice}:** {error_ref[0]}", get_chat_header()
         return
 
@@ -2982,7 +3044,7 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
         _state["model"] = pipeline.handle.model
         _state["tokenizer"] = pipeline.handle.tokenizer
         _state["steering"] = None
-        _state["status"] = "ready"
+        _clear_busy_locked("ready")
         _state["output_dir"] = "/tmp/obliterated"  # re-abliteration fallback path
         _state["session_label"] = choice
 
