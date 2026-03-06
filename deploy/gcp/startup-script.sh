@@ -25,6 +25,15 @@ export HOST_BIND="${HOST_BIND:-127.0.0.1}"
 export ENABLE_NGINX="${ENABLE_NGINX:-1}"
 export INSTALL_OPS_AGENT="${INSTALL_OPS_AGENT:-0}"
 
+if [[ -f "/etc/systemd/system/obliteratus.service" && -x "${APP_DIR}/.venv/bin/python" ]]; then
+  systemctl daemon-reload
+  systemctl enable --now obliteratus
+  if [[ "${ENABLE_NGINX}" == "1" ]]; then
+    systemctl enable --now nginx
+  fi
+  exit 0
+fi
+
 if [[ -x "${APP_DIR}/deploy/gcp/bootstrap.sh" ]]; then
   bash "${APP_DIR}/deploy/gcp/bootstrap.sh"
   exit 0
